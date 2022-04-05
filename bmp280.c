@@ -9,25 +9,20 @@
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "math.h"
-#include "../../FLYC.h"
-#include "../../pins.h"
+
+// 101325 Pa = standard pressure at msl
+#define seaLevelPa 101325
 
 // Local functions
 int32_t compensate_temp(int32_t adc_T);
 uint32_t compensate_pressure(int32_t adc_P);
 bool read_registers(uint8_t reg, uint8_t *buffer, uint16_t len);
 bool read_compensation_parameters();
-bool bme280_read_raw(int32_t *pressure, int32_t *temperature);
 
-// BMP280 on the 0x76
-const int DeviceAddress = 0x76; 
 
-// Variables
-int32_t temperature;
-uint32_t pressure;
-
-// 101325 Pa = standard pressure at msl
-#define seaLevelPa 101325
+// Global variables
+uint8_t device_address; // BMP280 typically on the 0x76
+i2c_inst_t* i2c_port; // i2c
 
 // Calibration variables. I'll leave these be.
 int32_t t_fine;
@@ -40,45 +35,44 @@ int8_t dig_H6;
 int16_t dig_H2, dig_H4, dig_H5;
 
 
-bool bmp_setup() {
+// Setup BMP280, returns HIGH flag if this process fails.
+// Expects I2C bus to be pre-setup as can have multiple devices on bus.
+bool BMP_Setup(i2c_inst_t* _i2c_port_, uint8_t _device_address_) {
     printf("BMP280 -> ");
-    // I2C Initialisation. Using it at 400Khz.
-    i2c_init(I2C_SENSORS_PORT, 400*1000);
-    gpio_set_function(I2C_SENSORS_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SENSORS_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SENSORS_SDA);
-    gpio_pull_up(I2C_SENSORS_SCL);
 	
     uint8_t id;
     if(read_registers(0xD0, &id, 1) == false) { return(false);} // Get I2C ID byte from register
     if(id == 0x58)
     {
-        read_compensation_parameters();
-
-        uint8_t buffer[2] = {0xF4, 0x57};
-        if(i2c_write_timeout_us(I2C_SENSORS_PORT, DeviceAddress, buffer, sizeof(buffer), false, 10000) < 0) { return(false); }
-        printf("OK\n");
-        return(true);
+        if(read_compensation_parameters() != true) {  // no errors getting compensation numbers
+            uint8_t buffer[2] = {0xF4, 0x57};
+            if(i2c_write_timeout_us(_i2c_port_, _device_address_, buffer, sizeof(buffer), false, 10000) < 0) { return(false); }
+            printf("OK\n");
+            return(false);
+        }
     }
-    else
-    {
-        printf("ERR\n");
-        return(false);
-    }
+    printf("ERR\n");
+    return(true);
 }
 
-// Returns true if read successfully
-bool BMPReadValues() {
-    return(bme280_read_raw(&pressure, &temperature));  
+
+// Reads ADC values from BMP280, converts these to temperature and pressure.
+// Returns HIGH flag if error.
+// Pressure given in Pa
+// Temperature in (1/100) of 1°C
+bool BMP_Values(uint32_t *pressure, int16_t *temperature) {
+    uint8_t buffer[6];
+    int32_t adc_P, adc_T;
+
+    if(read_registers(0xF7, buffer, 6) == true) { return true; }
+    adc_T = ((uint32_t)buffer[0] << 12) | ((uint32_t)buffer[1] << 4) | (buffer[2] >> 4);
+    adc_P = ((uint32_t)buffer[3] << 12) | ((uint32_t)buffer[4] << 4 | buffer[5] >> 4);
+
+    *pressure = compensate_pressure(adc_P);
+    *temperature = compensate_temp(adc_T);
+    return(false);
 }
 
-uint32_t BMPPressure() {
-    return(compensate_pressure(pressure));
-}
-
-int32_t BMPTemperature() {
-    return(compensate_temp(temperature));
-}
 
 /* The following compensation functions are required to convert from the raw ADC
 data from the chip to something usable. Each chip has a different set of
@@ -119,23 +113,23 @@ uint32_t compensate_pressure(int32_t adc_P) {
 }
 
 
-// helper function to write single byte to register and read reply of len
-bool read_registers(uint8_t reg, uint8_t *buffer, uint16_t len)
-{
-    if(i2c_write_timeout_us(I2C_SENSORS_PORT, DeviceAddress, &reg, 1, true, 10000) < 0) {return false; } // true to keep master control of bus
-    if(i2c_read_timeout_us(I2C_SENSORS_PORT, DeviceAddress, buffer, len, false, 10000) < 0) {return false; }
-    return(true);
+// Helper function to write single byte to register and read reply of len.
+// Returns HIGH flag if error.
+bool read_registers(uint8_t reg, uint8_t *buffer, uint16_t len) {
+    if(i2c_write_timeout_us(i2c_port, device_address, &reg, 1, true, 10000) < 0) {return true; } // true to keep master control of bus
+    if(i2c_read_timeout_us(i2c_port, device_address, buffer, len, false, 10000) < 0) {return true; }
+    return(false);
 }
 
-/* This function reads the manufacturing assigned compensation parameters from the device */
-// returns true if read correctly.
+// This function reads the manufacturing assigned compensation parameters from the device
+// Returns HIGH if error.
 bool read_compensation_parameters()
 {
     uint8_t buffer[26];
     uint8_t address;
 
     address = 0x88;
-    if(read_registers(address,buffer,24) == false) { return(false); }
+    if(read_registers(address,buffer,24) == true) { return(true); }
 
     dig_T1 = buffer[0] | (buffer[1] << 8);
     dig_T2 = buffer[2] | (buffer[3] << 8);
@@ -154,7 +148,7 @@ bool read_compensation_parameters()
     dig_H1 = buffer[25];
 
     address = 0xE1;
-    if(read_registers(address,buffer,8) == false) { return(false); }
+    if(read_registers(address,buffer,8) == true) { return(true); }
 
     dig_H2 = buffer[0] | (buffer[1] << 8);
     dig_H3 = (int8_t)buffer[2];
@@ -162,15 +156,7 @@ bool read_compensation_parameters()
     dig_H5 = (buffer[5] >> 4) | (buffer[6] << 4);
     dig_H6 = (int8_t)buffer[7];
 
-    return(true);
+    return(false);
 }
 
-bool bme280_read_raw(int32_t *pressure, int32_t *temperature) {
-    uint8_t buffer[6];
-
-    if(read_registers(0xF7, buffer, 6) == false) { return false; }
-    *pressure = ((uint32_t)buffer[0] << 12) | ((uint32_t)buffer[1] << 4) | (buffer[2] >> 4);
-    *temperature = ((uint32_t)buffer[3] << 12) | ((uint32_t)buffer[4] << 4 | buffer[5] >> 4);
-    return(true);
-}
 
